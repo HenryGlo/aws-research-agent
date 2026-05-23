@@ -14,9 +14,7 @@ from typing import Any
 import httpx
 from bs4 import BeautifulSoup
 
-from src.config import settings
 from src.tools.base import BaseTool
-
 
 # Limit response size to stay within Claude context window
 # 50,000 chars ≈ 12,500 tokens (one fetch shouldn't dominate context)
