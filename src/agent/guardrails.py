@@ -8,14 +8,12 @@ Design philosophy: the model decides WHAT to do; guardrails decide WHEN
 to stop it from doing too much. Separation of concerns.
 
 Pricing constants are for Claude Sonnet 4.6 (approximate, USD per token).
-Update if pricing changes.
 """
 from dataclasses import dataclass, field
 
 from src.logger import logger
 
 # Claude Sonnet 4.6 pricing (USD per token, approximate)
-# $3 per million input tokens, $15 per million output tokens
 PRICE_PER_INPUT_TOKEN = 3.0 / 1_000_000
 PRICE_PER_OUTPUT_TOKEN = 15.0 / 1_000_000
 
@@ -24,10 +22,10 @@ PRICE_PER_OUTPUT_TOKEN = 15.0 / 1_000_000
 class GuardrailLimits:
   """Configurable limits for agent execution."""
 
-  max_total_input_tokens: int = 50_000  # cumulative across iterations
-  max_cost_usd: float = 0.50  # hard cost ceiling per query
-  max_iterations: int = 10  # already in agent, but tracked here too
-  max_duplicate_queries: int = 2  # how many near-identical queries allowed
+  max_total_input_tokens: int = 50_000
+  max_cost_usd: float = 0.50
+  max_iterations: int = 10
+  max_duplicate_queries: int = 2
 
 
 @dataclass
@@ -44,19 +42,7 @@ class GuardrailState:
 
 
 class AgentGuardrails:
-  """Enforces cost and safety limits during agent execution.
-
-  Usage:
-      guardrails = AgentGuardrails()
-      ...
-      # after each Claude call:
-      guardrails.record_usage(input_tokens, output_tokens)
-      # before each tool call:
-      guardrails.record_query(query)  # for search-like tools
-      # check at top of each iteration:
-      if guardrails.should_stop():
-          # force synthesis with guardrails.state.stop_reason
-  """
+  """Enforces cost and safety limits during agent execution."""
 
   def __init__(self, limits: GuardrailLimits | None = None):
       self.limits = limits or GuardrailLimits()
@@ -77,11 +63,7 @@ class AgentGuardrails:
       self.state.recent_queries.append(query.lower().strip())
 
   def _is_looping(self) -> bool:
-      """Detect if the agent is repeating near-identical queries.
-
-      Simple heuristic: count queries that share significant word overlap.
-      Not perfect, but catches the common 'rephrase and retry' loop.
-      """
+      """Detect if the agent is repeating near-identical queries."""
       if len(self.state.recent_queries) < 2:
           return False
 
@@ -92,18 +74,14 @@ class AgentGuardrails:
           prev_words = set(prev.split())
           if not prev_words or not latest:
               continue
-          # Jaccard similarity: intersection over union
           overlap = len(latest & prev_words) / len(latest | prev_words)
-          if overlap > 0.6:  # 60% word overlap = near-duplicate
+          if overlap > 0.6:
               duplicate_count += 1
 
       return duplicate_count >= self.limits.max_duplicate_queries
 
   def should_stop(self) -> bool:
-      """Check all limits. Returns True if agent should stop and synthesize.
-
-      Sets state.stop_reason with a human-readable explanation.
-      """
+      """Check all limits. Returns True if agent should stop and synthesize."""
       if self.state.total_input_tokens >= self.limits.max_total_input_tokens:
           self._trigger_stop(
               f"Token budget reached "
@@ -113,8 +91,7 @@ class AgentGuardrails:
 
       if self.state.estimated_cost_usd >= self.limits.max_cost_usd:
           self._trigger_stop(
-              f"Cost ceiling reached "
-              f"(${self.state.estimated_cost_usd:.3f})"
+              f"Cost ceiling reached (${self.state.estimated_cost_usd:.3f})"
           )
           return True
 
