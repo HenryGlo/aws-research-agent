@@ -1,11 +1,14 @@
-"""Reusable agent loop with tool use and cost guardrails.
+"""Reusable agent loop with tool use, cost guardrails, and observability.
 
-This is the core of the agent. It handles:
-- Multiple tools registered as a dict {name: tool}
-- The conversation loop: send message → check stop_reason → execute tools → repeat
-- Cost and safety guardrails (token budget, cost ceiling, loop detection)
-- Graceful synthesis when a guardrail triggers (instead of crashing)
-- Logging of each step for observability
+This is the core of the agent. It coordinates three concerns, each in its
+own module:
+- Agent (this file): orchestration of the tool-use loop
+- AgentGuardrails: cost/safety circuit breakers (token budget, cost, loops)
+- AgentObserver: real-time observability of the reasoning process
+
+The loop: send message → check guardrails → call Claude → check stop_reason
+→ execute tools → repeat. When a guardrail triggers, the agent gracefully
+synthesizes with what it has instead of crashing.
 
 Usage:
   agent = Agent(tools=[WebSearchTool(), WebFetchTool()])
@@ -14,6 +17,7 @@ Usage:
 from anthropic import Anthropic
 
 from src.agent.guardrails import AgentGuardrails, GuardrailLimits
+from src.agent.observer import AgentObserver
 from src.config import settings
 from src.logger import logger
 from src.tools.base import BaseTool
@@ -28,6 +32,7 @@ class Agent:
       system_prompt: str | None = None,
       max_iterations: int | None = None,
       guardrail_limits: GuardrailLimits | None = None,
+      verbose: bool = True,
   ):
       self.client = Anthropic(api_key=settings.anthropic_api_key)
       self.tools_by_name = {tool.name: tool for tool in tools}
@@ -35,6 +40,7 @@ class Agent:
       self.system_prompt = system_prompt or self._default_system_prompt()
       self.max_iterations = max_iterations or settings.max_agent_iterations
       self.guardrail_limits = guardrail_limits
+      self.observer = AgentObserver(verbose=verbose)
 
   def _default_system_prompt(self) -> str:
       return (
@@ -68,24 +74,38 @@ class Agent:
       )
 
   def run(self, user_query: str) -> dict:
-      """Run the agent loop with guardrails until completion."""
+      """Run the agent loop with guardrails and observability."""
       messages = [{"role": "user", "content": user_query}]
       tool_calls_log = []
 
-      # Initialize guardrails for this run
       guardrails = AgentGuardrails(limits=self.guardrail_limits)
 
       logger.info("agent_started", query=user_query[:100])
+      self.observer.on_agent_start(user_query)
 
       while True:
+          self.observer.on_iteration_start(guardrails.state.iterations + 1)
+
           # CHECK GUARDRAILS before each iteration
           if guardrails.should_stop():
               logger.warning(
                   "agent_stopped_by_guardrail",
                   reason=guardrails.state.stop_reason,
               )
+              self.observer.on_synthesis(
+                  iteration=guardrails.state.iterations,
+                  cost_usd=guardrails.state.estimated_cost_usd,
+                  total_tokens=guardrails.state.total_input_tokens,
+                  forced=True,
+              )
               final_answer = self._force_synthesis(
                   messages, guardrails.state.stop_reason
+              )
+              self.observer.on_agent_complete(
+                  iterations=guardrails.state.iterations,
+                  cost_usd=guardrails.state.estimated_cost_usd,
+                  total_tokens=guardrails.state.total_input_tokens,
+                  stopped_by_guardrail=True,
               )
               return {
                   "final_answer": final_answer,
@@ -105,7 +125,6 @@ class Agent:
               messages=messages,
           )
 
-          # Record usage in guardrails
           guardrails.record_usage(
               response.usage.input_tokens,
               response.usage.output_tokens,
@@ -121,6 +140,18 @@ class Agent:
           # CASE 1: Claude finished
           if response.stop_reason == "end_turn":
               final_text = self._extract_text(response.content)
+              self.observer.on_synthesis(
+                  iteration=guardrails.state.iterations,
+                  cost_usd=guardrails.state.estimated_cost_usd,
+                  total_tokens=guardrails.state.total_input_tokens,
+                  forced=False,
+              )
+              self.observer.on_agent_complete(
+                  iterations=guardrails.state.iterations,
+                  cost_usd=guardrails.state.estimated_cost_usd,
+                  total_tokens=guardrails.state.total_input_tokens,
+                  stopped_by_guardrail=False,
+              )
               logger.info(
                   "agent_completed",
                   iterations=guardrails.state.iterations,
@@ -151,6 +182,13 @@ class Agent:
                       "tool_use_requested",
                       tool_name=block.name,
                       tool_input=block.input,
+                  )
+                  self.observer.on_tool_decision(
+                      iteration=guardrails.state.iterations,
+                      tool_name=block.name,
+                      tool_input=block.input,
+                      cost_usd=guardrails.state.estimated_cost_usd,
+                      total_tokens=guardrails.state.total_input_tokens,
                   )
 
                   tool = self.tools_by_name.get(block.name)
