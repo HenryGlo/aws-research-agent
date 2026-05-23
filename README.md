@@ -1,156 +1,193 @@
-"""Cost and safety guardrails for the agent.
+# AWS Research Agent
 
-Agents can run away: looping on unsolvable queries, accumulating context
-until they hit rate limits, or burning budget. This class enforces hard
-limits independently of the model's own decisions.
+> An autonomous AI research agent for AWS and cloud computing topics. Built with Claude Sonnet 4.6 tool use via the Anthropic SDK directly (no LangChain). Features multi-tool reasoning, cost guardrails, and real-time observability.
 
-Design philosophy: the model decides WHAT to do; guardrails decide WHEN
-to stop it from doing too much. Separation of concerns.
+![Demo](docs/demo.gif)
 
-Pricing constants are for Claude Sonnet 4.6 (approximate, USD per token).
-Update if pricing changes.
-"""
-from dataclasses import dataclass, field
+[![CI](https://github.com/HenryGlo/aws-research-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/HenryGlo/aws-research-agent/actions)
+[![Python](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-from src.logger import logger
+---
 
-# Claude Sonnet 4.6 pricing (USD per token, approximate)
-# $3 per million input tokens, $15 per million output tokens
-PRICE_PER_INPUT_TOKEN = 3.0 / 1_000_000
-PRICE_PER_OUTPUT_TOKEN = 15.0 / 1_000_000
+## 🎯 What It Does
 
+Given a question about AWS or cloud computing, the agent autonomously:
 
-@dataclass
-class GuardrailLimits:
-  """Configurable limits for agent execution."""
+1. **Decides** which tools to use (web search, page fetching)
+2. **Searches** the web for current information
+3. **Fetches** full content from the most relevant sources
+4. **Synthesizes** a structured answer with citations
 
-  max_total_input_tokens: int = 50_000  # cumulative across iterations
-  max_cost_usd: float = 0.50  # hard cost ceiling per query
-  max_iterations: int = 10  # already in agent, but tracked here too
-  max_duplicate_queries: int = 2  # how many near-identical queries allowed
+All while tracking cost in real time and enforcing safety limits to prevent runaway loops.
 
+---
 
-@dataclass
-class GuardrailState:
-  """Mutable state tracking usage during a single agent run."""
+## ✨ Key Features
 
-  total_input_tokens: int = 0
-  total_output_tokens: int = 0
-  iterations: int = 0
-  estimated_cost_usd: float = 0.0
-  recent_queries: list[str] = field(default_factory=list)
-  stop_triggered: bool = False
-  stop_reason: str = ""
+- **Direct Anthropic SDK** — built on Claude's raw tool-use protocol, not LangChain. Full control over the agent loop and complete observability.
+- **Cost guardrails** — circuit breakers for token budget, cost ceiling, iteration limits, and loop detection. The agent gracefully synthesizes when limits are hit instead of crashing.
+- **Real-time observability** — every decision (which tool, why, how much it cost) is surfaced live as the agent reasons.
+- **Graceful failure** — when information isn't publicly available, the agent acknowledges it honestly instead of looping endlessly.
+- **Modular architecture** — separation of concerns across three components: orchestration, guardrails, and observability.
 
+---
 
-class AgentGuardrails:
-  """Enforces cost and safety limits during agent execution.
+## 🏗️ Architecture
 
-  Usage:
-      guardrails = AgentGuardrails()
-      ...
-      # after each Claude call:
-      guardrails.record_usage(input_tokens, output_tokens)
-      # before each tool call:
-      guardrails.record_query(query)  # for search-like tools
-      # check at top of each iteration:
-      if guardrails.should_stop():
-          # force synthesis with guardrails.state.stop_reason
-  """
+The agent is built from three independent, single-responsibility components:
 
-  def __init__(self, limits: GuardrailLimits | None = None):
-      self.limits = limits or GuardrailLimits()
-      self.state = GuardrailState()
+```mermaid
+flowchart TD
+    User[User Query] --> Agent[Agent - orchestration]
+    Agent --> Claude[Claude Sonnet 4.6]
+    Claude -->|tool_use| Tools[Tools: web_search, web_fetch]
+    Tools -->|results| Agent
+    Agent --> Guardrails[AgentGuardrails - cost control]
+    Agent --> Observer[AgentObserver - live observability]
+    Claude -->|end_turn| Answer[Synthesized Answer + Citations]
+```
 
-  def record_usage(self, input_tokens: int, output_tokens: int) -> None:
-      """Record token usage from a Claude API call."""
-      self.state.total_input_tokens += input_tokens
-      self.state.total_output_tokens += output_tokens
-      self.state.iterations += 1
-      self.state.estimated_cost_usd = (
-          self.state.total_input_tokens * PRICE_PER_INPUT_TOKEN
-          + self.state.total_output_tokens * PRICE_PER_OUTPUT_TOKEN
-      )
+- **`Agent`** (`loop.py`) — orchestrates the tool-use loop
+- **`AgentGuardrails`** (`guardrails.py`) — token budget, cost ceiling, loop detection
+- **`AgentObserver`** (`observer.py`) — real-time reasoning display
 
-  def record_query(self, query: str) -> None:
-      """Record a search query to detect repetitive looping."""
-      self.state.recent_queries.append(query.lower().strip())
+---
 
-  def _is_looping(self) -> bool:
-      """Detect if the agent is repeating near-identical queries.
+## 🧠 The Agent Loop
 
-      Simple heuristic: count queries that share significant word overlap.
-      Not perfect, but catches the common 'rephrase and retry' loop.
-      """
-      if len(self.state.recent_queries) < 2:
-          return False
+The core protocol, implemented directly on the Anthropic SDK:
 
-      latest = set(self.state.recent_queries[-1].split())
-      duplicate_count = 0
+1. Send the query to Claude **with available tools**
+2. Claude responds with `stop_reason`:
+   - `tool_use` → Claude wants to run a tool
+   - `end_turn` → Claude has a final answer
+3. If `tool_use`: execute the tool locally, feed results back
+4. Loop until `end_turn` (or a guardrail triggers graceful synthesis)
 
-      for prev in self.state.recent_queries[:-1]:
-          prev_words = set(prev.split())
-          if not prev_words or not latest:
-              continue
-          # Jaccard similarity: intersection over union
-          overlap = len(latest & prev_words) / len(latest | prev_words)
-          if overlap > 0.6:  # 60% word overlap = near-duplicate
-              duplicate_count += 1
+**Key insight:** the model decides *what* to do; the code decides *when to stop it from doing too much*. Control flow is shared between the LLM and the guardrails.
 
-      return duplicate_count >= self.limits.max_duplicate_queries
+---
 
-  def should_stop(self) -> bool:
-      """Check all limits. Returns True if agent should stop and synthesize.
+## 🛡️ Cost Guardrails
 
-      Sets state.stop_reason with a human-readable explanation.
-      """
-      if self.state.total_input_tokens >= self.limits.max_total_input_tokens:
-          self._trigger_stop(
-              f"Token budget reached "
-              f"({self.state.total_input_tokens:,} input tokens)"
-          )
-          return True
+A standalone, unit-tested component that prevents runaway agents:
 
-      if self.state.estimated_cost_usd >= self.limits.max_cost_usd:
-          self._trigger_stop(
-              f"Cost ceiling reached "
-              f"(${self.state.estimated_cost_usd:.3f})"
-          )
-          return True
+| Guardrail | Default | Purpose |
+|-----------|---------|---------|
+| Token budget | 50,000 input tokens | Prevents context bloat |
+| Cost ceiling | $0.50 per query | Hard cost cap |
+| Max iterations | 10 | Prevents infinite loops |
+| Loop detection | 2 duplicate queries | Catches "rephrase and retry" loops |
 
-      if self.state.iterations >= self.limits.max_iterations:
-          self._trigger_stop(
-              f"Max iterations reached ({self.state.iterations})"
-          )
-          return True
+When any limit triggers, the agent **forces a synthesis** with what it has gathered — returning a useful partial answer instead of crashing.
 
-      if self._is_looping():
-          self._trigger_stop(
-              "Loop detected (agent repeating near-identical queries)"
-          )
-          return True
+---
 
-      return False
+## 📊 Real Performance
 
-  def _trigger_stop(self, reason: str) -> None:
-      """Mark the stop and log it."""
-      self.state.stop_triggered = True
-      self.state.stop_reason = reason
-      logger.warning(
-          "guardrail_triggered",
-          reason=reason,
-          total_input_tokens=self.state.total_input_tokens,
-          estimated_cost_usd=round(self.state.estimated_cost_usd, 4),
-          iterations=self.state.iterations,
-      )
+Example run on a deliberately hard query ("exact rate limits for Claude Sonnet 4.6 on AWS Bedrock" — information AWS doesn't fully publish):
 
-  def summary(self) -> dict:
-      """Return a summary of usage for observability."""
-      return {
-          "total_input_tokens": self.state.total_input_tokens,
-          "total_output_tokens": self.state.total_output_tokens,
-          "iterations": self.state.iterations,
-          "estimated_cost_usd": round(self.state.estimated_cost_usd, 4),
-          "stop_triggered": self.state.stop_triggered,
-          "stop_reason": self.state.stop_reason,
-      }
+| Metric | Value |
+|--------|-------|
+| Iterations | 3 |
+| Tool calls | 3 (search → fetch → search) |
+| Total tokens | ~11,500 |
+| Cost | ~$0.05 |
+| Outcome | Honest synthesis acknowledging what's public vs not |
+
+**Before guardrails**, the same query ran 10 iterations, 116K tokens, hit rate limits, and produced no answer. See [Lessons Learned](#-lessons-learned).
+
+---
+
+## 🛠️ Tech Stack
+
+**AI:** Claude Sonnet 4.6 (Anthropic SDK), tool use
+
+**Tools:** Tavily (web search), httpx + BeautifulSoup (web fetch)
+
+**Backend:** Python 3.11, Pydantic, structlog, rich
+
+**Quality:** pytest, ruff, GitHub Actions (CI)
+
+---
+
+## 🚀 Quick Start
+
+```bash
+git clone https://github.com/HenryGlo/aws-research-agent.git
+cd aws-research-agent
+
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+
+cp .env.example .env
+# Edit .env: add ANTHROPIC_API_KEY and TAVILY_API_KEY
+
+# Interactive CLI
+python -m scripts.cli
+```
+
+---
+
+## 📐 Design Decisions
+
+### Why the Anthropic SDK directly instead of LangChain?
+
+Building on the raw tool-use protocol means full control over the agent loop, transparent cost tracking, and the ability to debug exactly what the model decides. Frameworks abstract this away — useful for speed, but they hide the mechanics that matter most in production (cost, latency, failure modes).
+
+### Why separate Guardrails and Observer classes?
+
+Separation of concerns. The agent orchestrates; guardrails enforce limits; the observer reports. Each is independently testable. Guardrails have full unit-test coverage with no API calls.
+
+### Why graceful failure over exhaustive search?
+
+Some questions don't have public answers. An agent that searches endlessly burns budget and hits rate limits. Explicitly granting the model "permission to fail" — via the system prompt and guardrails — produces honest, useful answers and controls cost.
+
+---
+
+## 🧪 Testing
+
+```bash
+pytest tests/ -v
+```
+
+Tests cover guardrail logic (token budget, cost ceiling, loop detection — no API calls) and the web_fetch tool (mocked HTTP). CI runs lint + tests on every push.
+
+---
+
+## 📚 Lessons Learned
+
+- **Agents don't know when to give up.** Without explicit guidance, an LLM agent will keep searching for information that doesn't exist, burning tokens until it hits rate limits. The fix is granting "permission to fail" in the system prompt.
+- **Context bloat is real.** Each fetched page accumulates in the conversation history. Capping fetch size and limiting tool calls per query is essential for cost control.
+- **Control flow is shared.** In agentic systems, the model decides what to do; your code decides operational limits. Guardrails are how you enforce those limits independently of the model's decisions.
+- **Self-imposed cost ceilings prevent disasters.** A circuit breaker on token budget turned a $0.40+ runaway query into a $0.05 graceful answer.
+
+---
+
+## 🗺️ Roadmap
+
+- [ ] **RAG retrieval tool** — integrate a knowledge base as a third tool
+- [ ] **Code execution tool** — sandboxed Python for calculations (e.g., AWS cost estimates)
+- [ ] **Streaming responses** — token-by-token output for better UX
+- [ ] **REST API** — FastAPI wrapper for programmatic access
+- [ ] **Cross-family judge** — evaluate answer quality with a different model
+- [ ] **Conversation memory** — multi-turn context across questions
+
+---
+
+## 📄 License
+
+MIT License — see [LICENSE](LICENSE) for details.
+
+---
+
+## 👤 Author
+
+**Henry Gomez Lofiego**
+Senior ML Engineer | RAG & LLM Specialist | Master's in Data Science (in progress)
+
+- [LinkedIn](https://www.linkedin.com/in/henry-gomez-lofiego/)
+- 📧 henrylofiego@gmail.com
+- 🌎 Based in Venezuela · Open to remote roles globally
