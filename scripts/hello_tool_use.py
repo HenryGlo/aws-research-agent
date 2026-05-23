@@ -14,7 +14,6 @@ from anthropic import Anthropic
 from src.config import settings
 from src.logger import logger
 
-
 # 1. Define our single tool
 TOOLS = [
   {
